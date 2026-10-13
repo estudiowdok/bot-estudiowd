@@ -12,13 +12,113 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'EWD_BOT_2026';
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
+const SYNC_URL = process.env.SYNC_URL || 'https://estudiowd.com.ar/bot_session_sync.php';
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://bot-estudiowd.onrender.com';
 
 let sock = null;
 let currentQR = null;
 let isConnected = false;
 let userNumber = null;
+let syncTimeout = null;
+
+// ── Sincronización Remota de Sesión (para que Render nunca pierda la conexión) ──
+
+// Restaurar sesión desde cPanel si el disco local fue reiniciado
+async function restaurarSesionRemota() {
+    try {
+        const credsLocal = path.join(AUTH_DIR, 'creds.json');
+        if (fs.existsSync(credsLocal)) {
+            console.log('[SYNC] Credenciales locales encontradas en disco.');
+            return true;
+        }
+
+        console.log('[SYNC] Buscando respaldo de sesión en el servidor cPanel...');
+        const resp = await fetch(`${SYNC_URL}?action=get&token=${encodeURIComponent(API_KEY)}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EstudioWDBot/1.0' }
+        });
+        if (!resp.ok) {
+            console.log('[SYNC] Servidor de sincronización respondió con HTTP ' + resp.status);
+            return false;
+        }
+
+        const data = await resp.json();
+        if (data.ok && data.has_session && data.files) {
+            if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+            let count = 0;
+            for (const [filename, base64Content] of Object.entries(data.files)) {
+                const target = path.join(AUTH_DIR, filename);
+                fs.writeFileSync(target, Buffer.from(base64Content, 'base64'));
+                count++;
+            }
+            console.log(`[SYNC] ✅ Sesión restaurada con éxito desde cPanel (${count} archivos). Reconectando sin pedir QR.`);
+            return true;
+        } else {
+            console.log('[SYNC] No hay sesión previa guardada en cPanel. Se esperará escaneo de QR.');
+            return false;
+        }
+    } catch (err) {
+        console.error('[SYNC] Aviso al consultar respaldo remoto:', err.message);
+        return false;
+    }
+}
+
+// Respaldar sesión actual a cPanel
+async function respaldarSesionRemota() {
+    try {
+        if (!fs.existsSync(AUTH_DIR)) return;
+        const files = fs.readdirSync(AUTH_DIR).filter(f => f.endsWith('.json'));
+        if (files.length === 0 || !files.includes('creds.json')) return;
+
+        const bundle = {};
+        for (const file of files) {
+            const content = fs.readFileSync(path.join(AUTH_DIR, file));
+            bundle[file] = content.toString('base64');
+        }
+
+        const resp = await fetch(SYNC_URL, {
+            method: 'POST',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EstudioWDBot/1.0',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                token: API_KEY,
+                action: 'save',
+                files: bundle
+            })
+        });
+
+        if (resp.ok) {
+            const resJson = await resp.json();
+            if (resJson.ok) {
+                console.log(`[SYNC] 💾 Sesión de WhatsApp respaldada con éxito en cPanel (${files.length} archivos).`);
+            }
+        }
+    } catch (err) {
+        console.error('[SYNC] Error al respaldar sesión en cPanel:', err.message);
+    }
+}
+
+function programarRespaldo() {
+    if (syncTimeout) clearTimeout(syncTimeout);
+    syncTimeout = setTimeout(() => {
+        respaldarSesionRemota();
+    }, 4000);
+}
+
+// Borrar respaldo remoto si la sesión se cerró intencionalmente
+async function borrarSesionRemota() {
+    try {
+        await fetch(`${SYNC_URL}?action=clear&token=${encodeURIComponent(API_KEY)}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EstudioWDBot/1.0' }
+        });
+        console.log('[SYNC] Respaldo remoto eliminado tras cierre de sesión.');
+    } catch (e) {}
+}
 
 async function iniciarBot() {
+    await restaurarSesionRemota();
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     sock = makeWASocket({
@@ -27,7 +127,10 @@ async function iniciarBot() {
         browser: ['EstudioWD Bot', 'Chrome', '1.0.0']
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        programarRespaldo();
+    });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -54,6 +157,7 @@ async function iniciarBot() {
                 try {
                     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 } catch (e) {}
+                await borrarSesionRemota();
                 setTimeout(iniciarBot, 3000);
             }
         } else if (connection === 'open') {
@@ -61,9 +165,25 @@ async function iniciarBot() {
             currentQR = null;
             userNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Conectado';
             console.log(`[BOT] ✅ Conectado exitosamente a WhatsApp con el número: ${userNumber}`);
+            programarRespaldo();
         }
     });
 }
+
+// Keep-Alive anti-suspensión para Render (cada 10 minutos para que nunca se duerma)
+setInterval(async () => {
+    try {
+        const pingUrl = `${SELF_URL}/status`;
+        const res = await fetch(pingUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EstudioWD-KeepAlive/1.0' }
+        });
+        if (res.ok) {
+            console.log('[KEEP-ALIVE] Ping exitoso a Render. El servicio se mantiene despierto.');
+        }
+    } catch (err) {
+        console.log('[KEEP-ALIVE] Ping intentado:', err.message);
+    }
+}, 10 * 60 * 1000);
 
 // Normalizar número telefónico a formato WhatsApp JID
 function formatearJid(numero) {
@@ -280,3 +400,4 @@ app.listen(PORT, () => {
     console.log(`[BOT] Servidor escuchando en puerto ${PORT}`);
     iniciarBot();
 });
+
