@@ -20,6 +20,14 @@ let currentQR = null;
 let isConnected = false;
 let userNumber = null;
 let syncTimeout = null;
+let reinicioTimer = null;
+const msgCache = new Map(); // mensajes enviados (necesario para que WhatsApp pueda pedir reenvío)
+
+// Reinicio con "debounce": evita que se levanten 2 conexiones a la vez con la misma sesión
+function programarReinicio(ms) {
+    if (reinicioTimer) clearTimeout(reinicioTimer);
+    reinicioTimer = setTimeout(() => { reinicioTimer = null; iniciarBot(); }, ms);
+}
 
 // ── Sincronización Remota de Sesión (para que Render nunca pierda la conexión) ──
 
@@ -124,8 +132,12 @@ async function iniciarBot() {
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: ['EstudioWD Bot', 'Chrome', '1.0.0']
+        browser: ['EstudioWD Bot', 'Chrome', '1.0.0'],
+        getMessage: async (key) => msgCache.get(key.id) || undefined,
+        markOnlineOnConnect: false,
+        syncFullHistory: false
     });
+    const miSock = sock; // para ignorar eventos de conexiones viejas
 
     sock.ev.on('creds.update', async () => {
         await saveCreds();
@@ -133,6 +145,7 @@ async function iniciarBot() {
     });
 
     sock.ev.on('connection.update', async (update) => {
+        if (miSock !== sock) return; // evento de una conexión vieja
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -151,14 +164,14 @@ async function iniciarBot() {
             console.log(`[BOT] Conexión cerrada. Razón código: ${statusCode}. Reconectando: ${shouldReconnect}`);
 
             if (shouldReconnect) {
-                setTimeout(iniciarBot, 3000);
+                programarReinicio(3000);
             } else {
                 console.log('[BOT] Sesión cerrada permanentemente. Limpiando credenciales...');
                 try {
                     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 } catch (e) {}
                 await borrarSesionRemota();
-                setTimeout(iniciarBot, 3000);
+                programarReinicio(3000);
             }
         } else if (connection === 'open') {
             isConnected = true;
@@ -169,6 +182,9 @@ async function iniciarBot() {
         }
     });
 }
+
+// Respaldo periódico: las claves de cifrado cambian con cada mensaje y no siempre disparan creds.update
+setInterval(() => { if (isConnected) respaldarSesionRemota(); }, 5 * 60 * 1000);
 
 // Keep-Alive anti-suspensión para Render (cada 10 minutos para que nunca se duerma)
 setInterval(async () => {
@@ -349,7 +365,8 @@ app.all('/logout', async (req, res) => {
         try {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         } catch(e){}
-        setTimeout(iniciarBot, 1000);
+        await borrarSesionRemota();
+        programarReinicio(1500);
         res.json({ ok: true, msg: 'Sesión cerrada exitosamente' });
     } catch(err) {
         res.status(500).json({ ok: false, error: err.message });
@@ -375,8 +392,27 @@ const procesarEnvio = async (req, res) => {
     }
 
     try {
-        const jid = formatearJid(to);
+        let jid = formatearJid(to);
+
+        // Verificar que el número tenga WhatsApp (y usar el JID correcto que devuelve WhatsApp)
+        try {
+            const r = await sock.onWhatsApp(jid.split('@')[0]);
+            if (Array.isArray(r) && r.length > 0) {
+                if (r[0].exists === false) {
+                    return res.status(404).json({ ok: false, error: 'El número ' + jid.split('@')[0] + ' no tiene WhatsApp' });
+                }
+                if (r[0].jid) jid = r[0].jid;
+            }
+        } catch (e) {
+            console.log('[BOT] No se pudo verificar el número (se envía igual):', e.message);
+        }
+
         const result = await sock.sendMessage(jid, { text: message });
+        if (result?.key?.id && result.message) {
+            msgCache.set(result.key.id, result.message);
+            if (msgCache.size > 500) msgCache.delete(msgCache.keys().next().value);
+        }
+        programarRespaldo(); // guardar las claves de cifrado actualizadas en cPanel
         return res.json({
             ok: true,
             msg: 'Mensaje enviado con éxito',
